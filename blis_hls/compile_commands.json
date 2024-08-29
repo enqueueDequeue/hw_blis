@@ -1,0 +1,26 @@
+[
+  {
+    "directory": "/home/accelerating/vitisU_workspace/blis_hls",
+    "arguments": [
+      "/home/accelerating/xilinx/Vitis_HLS/2024.1/vcxx/libexec/clang++",
+      "-fhls",
+      "-hls-syn-headers-dir=/home/accelerating/xilinx/Vitis_HLS/2024.1/common/technology/autopilot",
+      "",
+      "-c",
+      "/home/accelerating/vitisU_workspace/blis_hls/hw_blis.cpp"
+    ],
+    "file": "/home/accelerating/vitisU_workspace/blis_hls/hw_blis.cpp"
+  },
+  {
+    "directory": "/home/accelerating/vitisU_workspace/blis_hls",
+    "arguments": [
+      "/home/accelerating/xilinx/Vitis_HLS/2024.1/vcxx/libexec/clang++",
+      "-fhls-tb",
+      "-hls-sim-headers-dir=/home/accelerating/xilinx/Vitis_HLS/2024.1/include",
+      "",
+      "-c",
+      "/home/accelerating/vitisU_workspace/blis_hls/hw_blis_tb.cpp"
+    ],
+    "file": "/home/accelerating/vitisU_workspace/blis_hls/hw_blis_tb.cpp"
+  }
+]
