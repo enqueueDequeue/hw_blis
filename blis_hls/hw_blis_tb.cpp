@@ -120,12 +120,12 @@ int main() {
 
             if (abs_delta > 0.001) {
                 std::cout << "Error: " << x << " != " << y << " @ (" << i << ", " << j << ")" << std::endl;
-                break;
+                return 1;
             }
             #elif D_TYPE_INT == D_TYPE
             if (x != y) {
                 std::cout << "Error: " << x << " != " << y << " @ (" << i << ", " << j << ")" << std::endl;
-                break;
+                return 2;
             }
             #endif
         }
