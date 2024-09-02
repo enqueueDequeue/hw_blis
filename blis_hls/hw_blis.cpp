@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <iostream>
 
@@ -425,20 +426,23 @@ static void macro_kernel(const BlisVec<blis_data_a_t, NUM_ELEMENTS_PER_VEC_A> *a
   for (blis_size_t po = 0; po < k; po += kc) {
     #pragma HLS LOOP_FLATTEN off
 
-    #pragma HLS LOOP_TRIPCOUNT min = (128 / kc) max = (1024 / kc)
+    #pragma HLS LOOP_TRIPCOUNT min = std::max(128 / kc, 1U) max = std::max(1024 / kc, 1U)
 
     blis_size_t io_k = 0;
     blis_size_t io_n = 0;
 
     loop_macro_mm_io:
     for (blis_size_t io = 0; io < m; io += mc) {
-      #pragma HLS LOOP_TRIPCOUNT min = (128 / mc) max = (1024 / mc)
+      #pragma HLS LOOP_TRIPCOUNT min = std::max(128 / mc, 1U) max = std::max(1024 / mc, 1U)
+
+      // todo: interchange the io & jo loops and check if it effects performance
+      // todo: check the effects of vec_load_c in the actual impl vs theory and sim
 
       vec_load<blis_data_a_t, NUM_ELEMENTS_PER_VEC_A, mc, kc, mr, KR>(io, po, m, k, mk, io_k, a, bram_block_a);
 
       loop_macro_mm_jo:
       for (blis_size_t jo = 0; jo < n; jo += nc) {
-        #pragma HLS LOOP_TRIPCOUNT min = (128 / nc) max = (1024 / nc)
+        #pragma HLS LOOP_TRIPCOUNT min = std::max(128 / nc, 1U) max = std::max(1024 / nc, 1U)
 
         vec_load<blis_data_b_t, NUM_ELEMENTS_PER_VEC_B, kc, nc, KR, nr>(po, jo, k, n, kn, po_n, b, bram_block_b);
 

@@ -29,8 +29,8 @@ NC_F_MIN = 1
 NC_F_MAX = 256
 
 SETUP_CMD = 'source ~/xilinx/Vitis/2024.1/settings64.sh'
-CSIM_CMD = 'vitis-run --mode hls --csim --config ./hls_config.cfg --work_dir blis_hls'
-CSYN_CMD = 'v++ -c --mode hls --config ./hls_config.cfg --work_dir blis_hls'
+CSIM_CMD = 'vitis-run --mode hls --csim --config ./hls_config.cfg --work_dir blis_hls > /dev/null'
+CSYN_CMD = 'v++ -c --mode hls --config ./hls_config.cfg --work_dir blis_hls > /dev/null'
 PACK_CMD = 'vitis-run --mode hls --package --config ./hls_config.cfg --work_dir blis_hls'
 
 HLS_DIR = 'blis_hls'
@@ -101,12 +101,13 @@ class Config:
 
 
 class Utilization:
-    def __init__(self, bram: float = -1, dsp: float = -1, ff: float = -1, lut: float = -1, latency_cycles: float = -1):
+    def __init__(self, bram: float = -1, dsp: float = -1, ff: float = -1, lut: float = -1, latency: float = -1, latency_unit: str = '?'):
         self.bram = bram
         self.dsp = dsp
         self.ff = ff
         self.lut = lut
-        self.latency_cycles = latency_cycles
+        self.latency = latency
+        self.latency_unit = latency_unit
         self.synthesizable = res_chk(self.bram) and res_chk(self.dsp) and res_chk(self.ff) and res_chk(self.lut)
 
     def synthesizable(self) -> bool:
@@ -142,9 +143,11 @@ def generate_header(config: Config) -> str:
 
 
 def synthesize(config: Config) -> Utilization:
-    prefix = f'blis_{config.kc}_{config.mc_f}_{config.nc_f}_{config.ms_f}_{config.ns_f}_{config.mr}_{config.nr}_'
+    config_desc = f'blis_{config.kc}_{config.mc_f}_{config.nc_f}_{config.ms_f}_{config.ns_f}_{config.mr}_{config.nr}'
 
-    with tempfile.TemporaryDirectory(prefix=prefix) as work_dir:
+    with tempfile.TemporaryDirectory(prefix=f'{config_desc}_') as work_dir:
+        print(f'config: {config_desc}: begin')
+
         # Generate the header file
         with open(f'{work_dir}/{HEADER_FILE}', 'w') as header_file:
             header_file.write(generate_header(config))
@@ -155,12 +158,14 @@ def synthesize(config: Config) -> Utilization:
         ret = os.system(f'cp {sources} {work_dir}')
 
         if ret != 0:
+            print(f'config: {config_desc}: cannot copy source files')
             return Utilization()
 
         # Execute the commands
         ret = os.system(f'/bin/bash -c "cd {work_dir} && {SETUP_CMD} && {CSIM_CMD} && {CSYN_CMD}"')
 
         if ret != 0:
+            print(f'config: {config_desc}: failed to synthesize')
             return Utilization()
 
         # Open the synthesis reports
@@ -186,11 +191,14 @@ def synthesize(config: Config) -> Utilization:
         performance_estimates = report_root.find('PerformanceEstimates')
 
         latency = float(performance_estimates.find('SummaryOfOverallLatency').find('Worst-caseLatency').text)
+        latency_unit = performance_estimates.find('SummaryOfOverallLatency').find('unit').text
 
         bram = utilized_bram / available_bram
         dsp = utilized_dsp / available_dsp
         ff = utilized_ff / available_ff
         lut = utilized_lut / available_lut
+
+        print(f'config: {config_desc}: bram: {bram}, dsp: {dsp}, ff: {ff}, lut: {lut}, latency: {latency} {latency_unit}')
 
         return Utilization(bram, dsp, ff, lut, latency)
 
@@ -208,7 +216,7 @@ def should_process(config: Config) -> bool:
     # lut is directly proportional to ms * ns
     c_lut = ms * ns
 
-    c_lut_limit = 16 * 1024
+    c_lut_limit = 32 * 1024
 
     c_lut_matches = c_lut <= c_lut_limit
 
@@ -262,13 +270,13 @@ def run():
 
     print(f'Testing {count} configurations')
 
-    with Pool(processes=32) as process_pool:
+    with Pool(processes=16) as process_pool:
         utilizations = process_pool.map(synthesize, configs)
 
-    print('n,kc,mc_f,nc_f,ms_f,ns_f,mr,nr,bram,dsp,ff,lut,latency_cycles')
+    print('n,kc,mc_f,nc_f,ms_f,ns_f,mr,nr,bram,dsp,ff,lut,latency,latency_units')
 
     for idx, config, utilization in enumerate(zip(configs, utilizations)):
-        print(f'{idx},{config.kc},{config.mc_f},{config.nc_f},{config.ms_f},{config.ns_f},{config.mr},{config.nr},{utilization.bram},{utilization.dsp},{utilization.ff},{utilization.lut},{utilization.latency_cycles}')
+        print(f'{idx},{config.kc},{config.mc_f},{config.nc_f},{config.ms_f},{config.ns_f},{config.mr},{config.nr},{utilization.bram},{utilization.dsp},{utilization.ff},{utilization.lut},{utilization.latency},{utilization.latency_unit}')
 
 
 if __name__ == '__main__':
