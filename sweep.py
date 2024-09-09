@@ -200,14 +200,14 @@ def synthesize(config: Config) -> Utilization:
 
         print(f'config: {config_desc}: bram: {bram}, dsp: {dsp}, ff: {ff}, lut: {lut}, latency: {latency} {latency_unit}')
 
-        return Utilization(bram, dsp, ff, lut, latency)
+        return (config, Utilization(bram, dsp, ff, lut, latency))
 
 
 def should_process(config: Config) -> bool:
     # inner kernel size filtering
     inner_kernel_size = config.mr * config.nr
 
-    kernel_matches = inner_kernel_size >= 128
+    kernel_matches = inner_kernel_size >= 128 and inner_kernel_size <= 512
 
     # c (lutram) filtering
     ms = config.ms_f * config.mr
@@ -269,14 +269,13 @@ def run():
         print(f'{idx}: kc={config.kc} mc_f={config.mc_f} nc_f={config.nc_f} ms_f={config.ms_f} ns_f={config.ns_f} mr={config.mr} nr={config.nr}')
 
     print(f'Testing {count} configurations')
-
-    with Pool(processes=16) as process_pool:
-        utilizations = process_pool.map(synthesize, configs)
+    exit(1)
 
     print('n,kc,mc_f,nc_f,ms_f,ns_f,mr,nr,bram,dsp,ff,lut,latency,latency_units')
 
-    for idx, config, utilization in enumerate(zip(configs, utilizations)):
-        print(f'{idx},{config.kc},{config.mc_f},{config.nc_f},{config.ms_f},{config.ns_f},{config.mr},{config.nr},{utilization.bram},{utilization.dsp},{utilization.ff},{utilization.lut},{utilization.latency},{utilization.latency_unit}')
+    with Pool(processes=16) as process_pool:
+        for idx, (config, utilization) in enumerate(process_pool.imap(synthesize, configs)):
+            print(f'{idx},{config.kc},{config.mc_f},{config.nc_f},{config.ms_f},{config.ns_f},{config.mr},{config.nr},{utilization.bram},{utilization.dsp},{utilization.ff},{utilization.lut},{utilization.latency},{utilization.latency_unit}')
 
 
 if __name__ == '__main__':
