@@ -1,10 +1,17 @@
 import os
+import sys
 import math
 import tempfile
+import random
 
 from typing import Iterator
+from typing import Tuple
+from typing import TypeVar
 from xml.etree import ElementTree
 from multiprocessing import Pool
+from concurrent.futures import ThreadPoolExecutor
+from fabric import Connection
+from invoke.runners import Promise
 
 
 MR_MIN = 2
@@ -29,13 +36,13 @@ NC_F_MIN = 1
 NC_F_MAX = 256
 
 SETUP_CMD = 'source ~/xilinx/Vitis/2024.1/settings64.sh'
-CSIM_CMD = 'vitis-run --mode hls --csim --config ./hls_config.cfg --work_dir blis_hls > /dev/null'
-CSYN_CMD = 'v++ -c --mode hls --config ./hls_config.cfg --work_dir blis_hls > /dev/null'
+CSIM_CMD = 'vitis-run --mode hls --csim --config ./hls_config.cfg --work_dir blis_hls'
+CSYN_CMD = 'v++ -c --mode hls --config ./hls_config.cfg --work_dir blis_hls'
 PACK_CMD = 'vitis-run --mode hls --package --config ./hls_config.cfg --work_dir blis_hls'
 
 HLS_DIR = 'blis_hls'
 HEADER_FILE = 'hw_blis.h'
-SOURCE_FILES = [ 'hls_config.cfg', 'hw_blis.cpp', 'hw_blis_tb.cpp' ]
+SOURCE_FILES = [ HEADER_FILE, 'hls_config.cfg', 'hw_blis.cpp', 'hw_blis_tb.cpp' ]
 
 BLIS_HEADER_TEMPLATE = '''
 #pragma once
@@ -142,15 +149,40 @@ def generate_header(config: Config) -> str:
     return BLIS_HEADER_TEMPLATE.format(kc=kc, mr=mr, nr=nr, ms=(mr * ms_f), ns=(nr * ns_f), mc=(mr * ms_f * mc_f), nc=(nr * ns_f * nc_f), op_1='(r) = (a) * (b)', op_2='(r) = (a) + (b)')
 
 
-def synthesize(config: Config) -> Utilization:
+def process_configs(args: Tuple[Iterator[Config], str, int, int, str]) -> list[Tuple[Config, Utilization]]:
+
+    (configs, worker, wid, cid, logs_path) = args
+
+    configs = list(configs)
+
+    logs_dir = os.path.dirname(logs_path)
+    logs_file_basename = os.path.basename(logs_path)
+
+    logs_file_name, logs_file_ext = os.path.splitext(logs_file_basename)
+
+    results = []
+
+    with open(f'{logs_dir}/{logs_file_name}_w{wid}_c{cid}{logs_file_ext}', 'w') as log_file:
+        print(f'rank: {cid}@{wid} testing {len(configs)} configs, logging to: {log_file.name}')
+
+        with Connection(worker) as con:
+            for cfg in configs:
+                util = work(cfg, con, wid, cid)
+                log_file.write(f'{cfg.kc},{cfg.mc_f},{cfg.nc_f},{cfg.ms_f},{cfg.ns_f},{cfg.mr},{cfg.nr},{util.bram},{util.dsp},{util.ff},{util.lut},{util.latency},{util.latency_unit}\n')
+                results.append((cfg, util))
+
+    return results
+
+
+def work(config: Config, con: Connection, wid: int, cid: int) -> Utilization:
     config_desc = f'blis_{config.kc}_{config.mc_f}_{config.nc_f}_{config.ms_f}_{config.ns_f}_{config.mr}_{config.nr}'
 
     with tempfile.TemporaryDirectory(prefix=f'{config_desc}_') as work_dir:
         print(f'config: {config_desc}: begin')
 
-        # Generate the header file
-        with open(f'{work_dir}/{HEADER_FILE}', 'w') as header_file:
-            header_file.write(generate_header(config))
+        # NOTE: Currently generating the header file and copying all
+        #       the source files. This can always be changed to generating
+        #       all the files and config files for generation.
 
         # Copy the files to the working directory
         sources = ' '.join([ f'./{HLS_DIR}/{f}' for f in SOURCE_FILES ])
@@ -158,18 +190,80 @@ def synthesize(config: Config) -> Utilization:
         ret = os.system(f'cp {sources} {work_dir}')
 
         if ret != 0:
-            print(f'config: {config_desc}: cannot copy source files')
+            print(f'config: {config_desc}: cannot copy source files locally')
             return Utilization()
+
+        # Generate the header file and overwrite the original one
+        with open(f'{work_dir}/{HEADER_FILE}', 'w') as header_file:
+            header_file.write(generate_header(config))
+
+        # create a temp directory in remote
+        r_tmp_dir = None
+
+        try:
+            res = con.run('mktemp')
+
+            if res.exited != 0:
+                raise Exception(f'error occurred while creating temp directory, return code: {res.exited}')
+
+            r_tmp_dir = res.stdout.lstrip().rstrip()
+        except Exception as e:
+            print(f'error occurred {e}')
+            return Utilization()
+
+        assert(r_tmp_dir is not None)
+
+        # push the files to the remote
+        for source in SOURCE_FILES:
+            try:
+                res = con.put(f'{work_dir}/{source}', f'{r_tmp_dir}/')
+
+                if res.exited != 0:
+                    raise Exception(f'Illegal exit code: {res.exited}')
+            except Exception as e:
+                print(f'error occured while copying files to remote: {e}')
+                return Utilization()
 
         # Execute the commands
-        ret = os.system(f'/bin/bash -c "cd {work_dir} && {SETUP_CMD} && {CSIM_CMD} && {CSYN_CMD}"')
+        # timeout = 20 mins
+        try:
+            res = con.run(f'timeout --signal=SIGINT 20m docker run --rm -v {r_tmp_dir}:/opt/data -it xilinx /bin/bash -c "{SETUP_CMD} && cd /opt/data && {CSIM_CMD} && {CSYN_CMD}"')
 
-        if ret != 0:
-            print(f'config: {config_desc}: failed to synthesize')
+            if res.exited != 0:
+                raise Exception(f'''
+                                Error occured while synthesizing the config:
+                                return code: {res.exited}
+                                ---------------------------------------------
+                                stdout:
+                                {res.stdout}
+                                ---------------------------------------------
+                                stderr:
+                                {res.stderr}''')
+        except Exception as e:
+            print(f'Error occurred while running the synth command: {e}')
             return Utilization()
 
+        # Copy the results file back to the local
+        try:
+            res = con.get(f'{r_tmp_dir}/blis_hls/hls/syn/report/blis_csynth.xml', f'{work_dir}/')
+
+            if res.exited != 0:
+                raise Exception(f'Error while get the results file: {res.exited}')
+        except Exception as e:
+            print(f'Error occurred while getting the synth results: {e}')
+            return Utilization()
+
+        # delete the temp directory
+        try:
+            res = con.run(f'rm -rf {r_tmp_dir}')
+
+            if res.exited != 0:
+                raise Exception(f'Error while deleting the temporary directory, ret code: {res.exited}')
+        except Exception as e:
+            print(f'Failed to delete the remote tmp directory: {e}')
+
         # Open the synthesis reports
-        report_tree = ElementTree.parse(f'{work_dir}/blis_hls/hls/syn/report/blis_csynth.xml')
+        report_tree = ElementTree.parse(f'{work_dir}/blis_csynth.xml')
 
         report_root = report_tree.getroot()
 
@@ -200,7 +294,52 @@ def synthesize(config: Config) -> Utilization:
 
         print(f'config: {config_desc}: bram: {bram}, dsp: {dsp}, ff: {ff}, lut: {lut}, latency: {latency} {latency_unit}')
 
-        return (config, Utilization(bram, dsp, ff, lut, latency))
+        return Utilization(bram, dsp, ff, lut, latency)
+
+
+T = TypeVar('T')
+def chunkify(data: list[T], nchunks: int) -> Iterator[list[T]]:
+    dlen = len(data)
+
+    clen = dlen // nchunks
+    head = dlen % nchunks
+
+    start = 0
+
+    for r in range(nchunks):
+        end = (start + clen) + (1 if r < head else 0)
+
+        yield data[start : end]
+
+        start = end
+
+
+def synthesize(args: Tuple[list[Config], str, int, int]) -> list[Tuple[Config, Utilization]]:
+
+    (configs, slave, slave_id, logs_path) = args
+
+    print(f'rank: {slave_id} testing {len(configs)} configurations')
+
+    nremote_processes = 16
+
+    # Process 16 items at a time
+    # Each connection will run 16 configurations at a time
+    chunks = chunkify(configs, nremote_processes)
+
+    # NOTE: Currently opening (nremote_processes) connections
+    #       one per process essentially. But, it could be made to
+    #       be one per all of the processes. The reasoning behind this is:
+    #       I'm not sure about the MT-Safety of the underlying fabric arch.
+    #       I am not sure if invoking two run commands simultaneously
+    #       could cause some issues and potential race conditions.
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=nremote_processes) as pool:
+        for chunk_results in pool.map(process_configs, [ (chunk, slave, slave_id, idx, logs_path) for (idx, chunk) in enumerate(chunks)]):
+            results.extend(chunk_results)
+
+    return results
 
 
 def should_process(config: Config) -> bool:
@@ -245,9 +384,7 @@ def should_process(config: Config) -> bool:
     return matches
 
 
-def run():
-    count = 0
-
+def gen_configs() -> list[Config]:
     configs = []
 
     for kc in pow2_range(KC_MIN, KC_MAX):
@@ -261,22 +398,52 @@ def run():
 
                                 if should_process(config):
                                     configs.append(config)
-                                    count += 1
+
+    return configs
+
+
+def run(logs_path: str, results_path: str):
+    workers = [ '10.0.2.15', '10.0.2.16' ]
+
+    configs = gen_configs()
+
+    # shuffle to make sure that not all
+    # heavy hitting configs are on one side
+    random.shuffle(configs)
 
     print('Testing')
 
     for idx, config in enumerate(configs):
         print(f'{idx}: kc={config.kc} mc_f={config.mc_f} nc_f={config.nc_f} ms_f={config.ms_f} ns_f={config.ns_f} mr={config.mr} nr={config.nr}')
 
-    print(f'Testing {count} configurations')
-    exit(1)
+    print(f'Testing {len(configs)} configurations')
 
-    print('n,kc,mc_f,nc_f,ms_f,ns_f,mr,nr,bram,dsp,ff,lut,latency,latency_units')
+    nworkers = len(workers)
 
-    with Pool(processes=16) as process_pool:
-        for idx, (config, utilization) in enumerate(process_pool.imap(synthesize, configs)):
-            print(f'{idx},{config.kc},{config.mc_f},{config.nc_f},{config.ms_f},{config.ns_f},{config.mr},{config.nr},{utilization.bram},{utilization.dsp},{utilization.ff},{utilization.lut},{utilization.latency},{utilization.latency_unit}')
+    chunks = chunkify(configs, nworkers)
+
+    results = []
+
+    with Pool(processes=nworkers) as process_pool:
+        for chunk_results in process_pool.imap(synthesize, [ (chunk, worker, idx, logs_path) for (idx, (worker, chunk)) in enumerate(zip(workers, chunks)) ]):
+            results.extend(chunk_results)
+
+    with open(results_path, 'w') as results_file:
+        print(f'results to: {results_file.name}')
+
+        results_file.write('kc,mc_f,nc_f,ms_f,ns_f,mr,nr,bram,dsp,ff,lut,latency,latency_units\n')
+
+        for config, utilization in results:
+            results_file.write(f'{config.kc},{config.mc_f},{config.nc_f},{config.ms_f},{config.ns_f},{config.mr},{config.nr},{utilization.bram},{utilization.dsp},{utilization.ff},{utilization.lut},{utilization.latency},{utilization.latency_unit}\n')
 
 
 if __name__ == '__main__':
-    run()
+    if len(sys.argv) != 3:
+        print('Incorrect usage')
+        print(f'Correct usage: {sys.argv[0]} <log file path> <results path>')
+        exit(1)
+
+    log_file_path = sys.argv[1]
+    results_path = sys.argv[2]
+
+    run(log_file_path, results_path)
