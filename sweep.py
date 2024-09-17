@@ -1,9 +1,11 @@
 import os
 import sys
 import math
+import time
 import tempfile
 import random
 
+from typing import IO
 from typing import Iterator
 from typing import Tuple
 from typing import TypeVar
@@ -11,7 +13,8 @@ from xml.etree import ElementTree
 from multiprocessing import Pool
 from concurrent.futures import ThreadPoolExecutor
 from fabric import Connection
-from invoke.runners import Promise
+
+from paramiko.pkey import PKey
 
 
 MR_MIN = 2
@@ -149,9 +152,17 @@ def generate_header(config: Config) -> str:
     return BLIS_HEADER_TEMPLATE.format(kc=kc, mr=mr, nr=nr, ms=(mr * ms_f), ns=(nr * ns_f), mc=(mr * ms_f * mc_f), nc=(nr * ns_f * nc_f), op_1='(r) = (a) * (b)', op_2='(r) = (a) + (b)')
 
 
-def process_configs(args: Tuple[Iterator[Config], str, int, int, str]) -> list[Tuple[Config, Utilization]]:
+def describe(config: Config) -> str:
+    return f'blis_{config.kc}_{config.mc_f}_{config.nc_f}_{config.ms_f}_{config.ns_f}_{config.mr}_{config.nr}'
 
-    (configs, worker, wid, cid, logs_path) = args
+
+def passphrase() -> str:
+    return os.getenv('OU_CLOUD_PASSPHRASE')
+
+
+def process_configs(args: Tuple[Iterator[Config], str, str, int, int, str]) -> list[Tuple[Config, Utilization]]:
+
+    (configs, key_file_path, worker, wid, cid, logs_path) = args
 
     configs = list(configs)
 
@@ -162,20 +173,25 @@ def process_configs(args: Tuple[Iterator[Config], str, int, int, str]) -> list[T
 
     results = []
 
-    with open(f'{logs_dir}/{logs_file_name}_w{wid}_c{cid}{logs_file_ext}', 'w') as log_file:
-        print(f'rank: {cid}@{wid} testing {len(configs)} configs, logging to: {log_file.name}')
+    pkey = PKey.from_path(key_file_path, passphrase().encode('utf-8'))
 
-        with Connection(worker) as con:
+    with open(f'{logs_dir}/{logs_file_name}_w{wid}_c{cid}{logs_file_ext}', 'w') as result_log_file:
+        # print(f'rank: {cid}@{wid} testing {len(configs)} configs, logging to: {log_file.name}')
+
+        with Connection(f'arya@{worker}', connect_kwargs={'pkey': pkey}) as con:
             for cfg in configs:
-                util = work(cfg, con, wid, cid)
-                log_file.write(f'{cfg.kc},{cfg.mc_f},{cfg.nc_f},{cfg.ms_f},{cfg.ns_f},{cfg.mr},{cfg.nr},{util.bram},{util.dsp},{util.ff},{util.lut},{util.latency},{util.latency_unit}\n')
-                results.append((cfg, util))
+                config_desc = describe(cfg)
+
+                with open(f'{logs_dir}/{logs_file_name}_{config_desc}_w{wid}_c{cid}{logs_file_ext}', 'w') as log_file:
+                    util = work(cfg, con, log_file)
+                    result_log_file.write(f'{cfg.kc},{cfg.mc_f},{cfg.nc_f},{cfg.ms_f},{cfg.ns_f},{cfg.mr},{cfg.nr},{util.bram},{util.dsp},{util.ff},{util.lut},{util.latency},{util.latency_unit}\n')
+                    results.append((cfg, util))
 
     return results
 
 
-def work(config: Config, con: Connection, wid: int, cid: int) -> Utilization:
-    config_desc = f'blis_{config.kc}_{config.mc_f}_{config.nc_f}_{config.ms_f}_{config.ns_f}_{config.mr}_{config.nr}'
+def work(config: Config, con: Connection, log_file: IO) -> Utilization:
+    config_desc = describe(config)
 
     with tempfile.TemporaryDirectory(prefix=f'{config_desc}_') as work_dir:
         print(f'config: {config_desc}: begin')
@@ -197,11 +213,19 @@ def work(config: Config, con: Connection, wid: int, cid: int) -> Utilization:
         with open(f'{work_dir}/{HEADER_FILE}', 'w') as header_file:
             header_file.write(generate_header(config))
 
+        try:
+            res = con.run('ip addr', out_stream=log_file)
+
+            if res.exited != 0:
+                raise Exception(f'error describing the machine, return code: {res.exited}')
+        except Exception as e:
+            print(f'error occurred while describing the machine, proceeding ahead, {e}')
+
         # create a temp directory in remote
         r_tmp_dir = None
 
         try:
-            res = con.run('mktemp')
+            res = con.run('mktemp -d', out_stream=log_file)
 
             if res.exited != 0:
                 raise Exception(f'error occurred while creating temp directory, return code: {res.exited}')
@@ -217,17 +241,16 @@ def work(config: Config, con: Connection, wid: int, cid: int) -> Utilization:
         for source in SOURCE_FILES:
             try:
                 res = con.put(f'{work_dir}/{source}', f'{r_tmp_dir}/')
-
-                if res.exited != 0:
-                    raise Exception(f'Illegal exit code: {res.exited}')
             except Exception as e:
                 print(f'error occured while copying files to remote: {e}')
                 return Utilization()
 
         # Execute the commands
         # timeout = 20 mins
+        start = time.time()
+
         try:
-            res = con.run(f'timeout --signal=SIGINT 20m docker run --rm -v {r_tmp_dir}:/opt/data -it xilinx /bin/bash -c "{SETUP_CMD} && cd /opt/data && {CSIM_CMD} && {CSYN_CMD}"')
+            res = con.run(f'timeout --signal=SIGKILL 20m docker run --rm -v {r_tmp_dir}:/opt/data xilinx /bin/bash -c "{SETUP_CMD} && cd /opt/data && {CSIM_CMD} && {CSYN_CMD}"', out_stream=log_file)
 
             if res.exited != 0:
                 raise Exception(f'''
@@ -240,22 +263,21 @@ def work(config: Config, con: Connection, wid: int, cid: int) -> Utilization:
                                 stderr:
                                 {res.stderr}''')
         except Exception as e:
-            print(f'Error occurred while running the synth command: {e}')
+            end = time.time()
+
+            print(f'config: {config_desc}: failed, elapsed: {end - start}s, generated by: {con}')
             return Utilization()
 
         # Copy the results file back to the local
         try:
             res = con.get(f'{r_tmp_dir}/blis_hls/hls/syn/report/blis_csynth.xml', f'{work_dir}/')
-
-            if res.exited != 0:
-                raise Exception(f'Error while get the results file: {res.exited}')
         except Exception as e:
             print(f'Error occurred while getting the synth results: {e}')
             return Utilization()
 
         # delete the temp directory
         try:
-            res = con.run(f'rm -rf {r_tmp_dir}')
+            res = con.run(f'docker run --rm -v {r_tmp_dir}:/opt/data xilinx /bin/bash -c "rm -rf /opt/data/*" && rm -rf {r_tmp_dir}')
 
             if res.exited != 0:
                 raise Exception(f'Error while deleting the temporary directory, ret code: {res.exited}')
@@ -292,9 +314,9 @@ def work(config: Config, con: Connection, wid: int, cid: int) -> Utilization:
         ff = utilized_ff / available_ff
         lut = utilized_lut / available_lut
 
-        print(f'config: {config_desc}: bram: {bram}, dsp: {dsp}, ff: {ff}, lut: {lut}, latency: {latency} {latency_unit}')
+        print(f'config: {config_desc}: bram: {bram}, dsp: {dsp}, ff: {ff}, lut: {lut}, latency: {latency} {latency_unit}, generated by: {con}')
 
-        return Utilization(bram, dsp, ff, lut, latency)
+        return Utilization(bram, dsp, ff, lut, latency, latency_unit)
 
 
 T = TypeVar('T')
@@ -314,9 +336,9 @@ def chunkify(data: list[T], nchunks: int) -> Iterator[list[T]]:
         start = end
 
 
-def synthesize(args: Tuple[list[Config], str, int, int]) -> list[Tuple[Config, Utilization]]:
+def synthesize(args: Tuple[list[Config], str, str, int, int]) -> list[Tuple[Config, Utilization]]:
 
-    (configs, slave, slave_id, logs_path) = args
+    (configs, key_file_path, slave, slave_id, logs_path) = args
 
     print(f'rank: {slave_id} testing {len(configs)} configurations')
 
@@ -336,7 +358,7 @@ def synthesize(args: Tuple[list[Config], str, int, int]) -> list[Tuple[Config, U
     results = []
 
     with ThreadPoolExecutor(max_workers=nremote_processes) as pool:
-        for chunk_results in pool.map(process_configs, [ (chunk, slave, slave_id, idx, logs_path) for (idx, chunk) in enumerate(chunks)]):
+        for chunk_results in pool.map(process_configs, [ (chunk, key_file_path, slave, slave_id, idx, logs_path) for (idx, chunk) in enumerate(chunks)]):
             results.extend(chunk_results)
 
     return results
@@ -402,8 +424,10 @@ def gen_configs() -> list[Config]:
     return configs
 
 
-def run(logs_path: str, results_path: str):
-    workers = [ '10.0.2.15', '10.0.2.16' ]
+def run(key_file_path:str, logs_path: str, results_path: str):
+    workers = [ f'10.0.2.{w}' for w in range(3, 19) ]
+
+    print(f'using workers: {workers}')
 
     configs = gen_configs()
 
@@ -425,7 +449,7 @@ def run(logs_path: str, results_path: str):
     results = []
 
     with Pool(processes=nworkers) as process_pool:
-        for chunk_results in process_pool.imap(synthesize, [ (chunk, worker, idx, logs_path) for (idx, (worker, chunk)) in enumerate(zip(workers, chunks)) ]):
+        for chunk_results in process_pool.imap(synthesize, [ (chunk, key_file_path, worker, idx, logs_path) for (idx, (worker, chunk)) in enumerate(zip(workers, chunks)) ]):
             results.extend(chunk_results)
 
     with open(results_path, 'w') as results_file:
@@ -438,12 +462,17 @@ def run(logs_path: str, results_path: str):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         print('Incorrect usage')
-        print(f'Correct usage: {sys.argv[0]} <log file path> <results path>')
+        print(f'Correct usage: {sys.argv[0]} <key file path> <log file path> <results path>')
         exit(1)
 
-    log_file_path = sys.argv[1]
-    results_path = sys.argv[2]
+    if passphrase() is None:
+        print('Using no passphrase. Are you sure?')
+        exit(2)
 
-    run(log_file_path, results_path)
+    key_file_path = sys.argv[1]
+    log_file_path = sys.argv[2]
+    results_path = sys.argv[3]
+
+    run(key_file_path, log_file_path, results_path)
