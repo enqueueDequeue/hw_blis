@@ -2,7 +2,7 @@ import os
 import sys
 import math
 import time
-import tempfile
+import uuid
 import random
 
 from typing import IO
@@ -13,7 +13,6 @@ from xml.etree import ElementTree
 from multiprocessing import Pool
 from concurrent.futures import ThreadPoolExecutor
 from fabric import Connection
-
 from paramiko.pkey import PKey
 
 
@@ -183,140 +182,164 @@ def process_configs(args: Tuple[Iterator[Config], str, str, int, int, str]) -> l
                 config_desc = describe(cfg)
 
                 with open(f'{logs_dir}/{logs_file_name}_{config_desc}_w{wid}_c{cid}{logs_file_ext}', 'w') as log_file:
-                    util = work(cfg, con, log_file)
+                    util = work(cfg, con, logs_dir, log_file)
                     result_log_file.write(f'{cfg.kc},{cfg.mc_f},{cfg.nc_f},{cfg.ms_f},{cfg.ns_f},{cfg.mr},{cfg.nr},{util.bram},{util.dsp},{util.ff},{util.lut},{util.latency},{util.latency_unit}\n')
                     results.append((cfg, util))
 
     return results
 
 
-def work(config: Config, con: Connection, log_file: IO) -> Utilization:
+def work(config: Config, con: Connection, logs_dir: str, log_file: IO) -> Utilization:
     config_desc = describe(config)
 
-    with tempfile.TemporaryDirectory(prefix=f'{config_desc}_') as work_dir:
-        print(f'config: {config_desc}: begin')
+    work_dir = f'{logs_dir}/{config_desc}_{uuid.uuid4()}'
 
-        # NOTE: Currently generating the header file and copying all
-        #       the source files. This can always be changed to generating
-        #       all the files and config files for generation.
+    if 0 != os.system(f'mkdir "{work_dir}"'):
+        print(f'config: {config_desc}: cannot mkdir')
+        return Utilization()
 
-        # Copy the files to the working directory
-        sources = ' '.join([ f'./{HLS_DIR}/{f}' for f in SOURCE_FILES ])
+    print(f'config: {config_desc}: begin @ {work_dir}')
 
-        ret = os.system(f'cp {sources} {work_dir}')
+    # NOTE: Currently generating the header file and copying all
+    #       the source files. This can always be changed to generating
+    #       all the files and config files for generation.
 
-        if ret != 0:
-            print(f'config: {config_desc}: cannot copy source files locally')
+    # Copy the files to the working directory
+    sources = ' '.join([ f'./{HLS_DIR}/{f}' for f in SOURCE_FILES ])
+
+    ret = os.system(f'cp {sources} {work_dir}')
+
+    if ret != 0:
+        print(f'config: {config_desc}: cannot copy source files locally')
+        return Utilization()
+
+    # Generate the header file and overwrite the original one
+    with open(f'{work_dir}/{HEADER_FILE}', 'w') as header_file:
+        header_file.write(generate_header(config))
+
+    try:
+        res = con.run('ip addr', out_stream=log_file)
+
+        if res.exited != 0:
+            raise Exception(f'error describing the machine, return code: {res.exited}')
+    except Exception as e:
+        print(f'error occurred while describing the machine, proceeding ahead, {e}')
+
+    # create a temp directory in remote
+    r_tmp_dir = None
+
+    try:
+        res = con.run('mktemp -d', out_stream=log_file)
+
+        if res.exited != 0:
+            raise Exception(f'error occurred while creating temp directory, return code: {res.exited}')
+
+        r_tmp_dir = res.stdout.lstrip().rstrip()
+    except Exception as e:
+        print(f'error occurred {e}')
+        return Utilization()
+
+    assert(r_tmp_dir is not None)
+
+    # push the files to the remote
+    for source in SOURCE_FILES:
+        try:
+            res = con.put(f'{work_dir}/{source}', f'{r_tmp_dir}/')
+        except Exception as e:
+            print(f'error occured while copying files to remote: {e}')
             return Utilization()
 
-        # Generate the header file and overwrite the original one
-        with open(f'{work_dir}/{HEADER_FILE}', 'w') as header_file:
-            header_file.write(generate_header(config))
+    # Execute the commands
+    # timeout = 20 mins
+    start = time.time()
 
-        try:
-            res = con.run('ip addr', out_stream=log_file)
+    try:
+        res = con.run(f'timeout --signal=SIGKILL 20m docker run --rm -v {r_tmp_dir}:/opt/data xilinx /bin/bash -c "{SETUP_CMD} && cd /opt/data && {CSIM_CMD} && {CSYN_CMD}"', out_stream=log_file)
 
-            if res.exited != 0:
-                raise Exception(f'error describing the machine, return code: {res.exited}')
-        except Exception as e:
-            print(f'error occurred while describing the machine, proceeding ahead, {e}')
+        if res.exited != 0:
+            raise Exception(f'''
+                            Error occured while synthesizing the config:
+                            return code: {res.exited}
+                            ---------------------------------------------
+                            stdout:
+                            {res.stdout}
+                            ---------------------------------------------
+                            stderr:
+                            {res.stderr}''')
+    except Exception as e:
+        end = time.time()
 
-        # create a temp directory in remote
-        r_tmp_dir = None
+        print(f'config: {config_desc}: failed, elapsed: {end - start}s, generated by: {con}')
+        return Utilization()
 
-        try:
-            res = con.run('mktemp -d', out_stream=log_file)
+    # tar the files and download the zip file
+    try:
+        res = con.run(f'cd {r_tmp_dir} && tar -zcvf reports.tar.gz ./blis_hls/hls/syn/report/*', out_stream=log_file)
 
-            if res.exited != 0:
-                raise Exception(f'error occurred while creating temp directory, return code: {res.exited}')
+        if res.exited != 0:
+            raise Exception(f'error occurred while zipping the files, return code: {res.exited}')
+    except Exception as e:
+        print(f'Error occurred while zipping the results: {e}')
+        return Utilization()
 
-            r_tmp_dir = res.stdout.lstrip().rstrip()
-        except Exception as e:
-            print(f'error occurred {e}')
-            return Utilization()
+    try:
+        res = con.get(f'{r_tmp_dir}/reports.tar.gz', f'{work_dir}/')
+    except Exception as e:
+        print(f'Error occurred while downloading the zipped results: {e}')
+        return Utilization()
 
-        assert(r_tmp_dir is not None)
+    # Copy the results file back to the local
+    try:
+        res = con.get(f'{r_tmp_dir}/blis_hls/hls/syn/report/blis_csynth.xml', f'{work_dir}/')
+    except Exception as e:
+        print(f'Error occurred while getting the synth results: {e}')
+        return Utilization()
 
-        # push the files to the remote
-        for source in SOURCE_FILES:
-            try:
-                res = con.put(f'{work_dir}/{source}', f'{r_tmp_dir}/')
-            except Exception as e:
-                print(f'error occured while copying files to remote: {e}')
-                return Utilization()
+    # delete the temp directory
+    try:
+        res = con.run(f'docker run --rm -v {r_tmp_dir}:/opt/data xilinx /bin/bash -c "rm -rf /opt/data/*" && rm -rf {r_tmp_dir}')
 
-        # Execute the commands
-        # timeout = 20 mins
-        start = time.time()
+        if res.exited != 0:
+            raise Exception(f'Error while deleting the temporary directory, ret code: {res.exited}')
+    except Exception as e:
+        print(f'Failed to delete the remote tmp directory: {e}')
 
-        try:
-            res = con.run(f'timeout --signal=SIGKILL 20m docker run --rm -v {r_tmp_dir}:/opt/data xilinx /bin/bash -c "{SETUP_CMD} && cd /opt/data && {CSIM_CMD} && {CSYN_CMD}"', out_stream=log_file)
+    # copy synth file to the logs
+    # todo: figure how to copy the results files
 
-            if res.exited != 0:
-                raise Exception(f'''
-                                Error occured while synthesizing the config:
-                                return code: {res.exited}
-                                ---------------------------------------------
-                                stdout:
-                                {res.stdout}
-                                ---------------------------------------------
-                                stderr:
-                                {res.stderr}''')
-        except Exception as e:
-            end = time.time()
+    # Open the synthesis reports
+    report_tree = ElementTree.parse(f'{work_dir}/blis_csynth.xml')
 
-            print(f'config: {config_desc}: failed, elapsed: {end - start}s, generated by: {con}')
-            return Utilization()
+    report_root = report_tree.getroot()
 
-        # Copy the results file back to the local
-        try:
-            res = con.get(f'{r_tmp_dir}/blis_hls/hls/syn/report/blis_csynth.xml', f'{work_dir}/')
-        except Exception as e:
-            print(f'Error occurred while getting the synth results: {e}')
-            return Utilization()
+    resource_estimates = report_root.find('AreaEstimates')
 
-        # delete the temp directory
-        try:
-            res = con.run(f'docker run --rm -v {r_tmp_dir}:/opt/data xilinx /bin/bash -c "rm -rf /opt/data/*" && rm -rf {r_tmp_dir}')
+    utilized_resources = resource_estimates.find('Resources')
+    available_resources = resource_estimates.find('AvailableResources')
 
-            if res.exited != 0:
-                raise Exception(f'Error while deleting the temporary directory, ret code: {res.exited}')
-        except Exception as e:
-            print(f'Failed to delete the remote tmp directory: {e}')
+    utilized_bram = float(utilized_resources.find('BRAM_18K').text)
+    utilized_dsp = float(utilized_resources.find('DSP').text)
+    utilized_ff = float(utilized_resources.find('FF').text)
+    utilized_lut = float(utilized_resources.find('LUT').text)
 
-        # Open the synthesis reports
-        report_tree = ElementTree.parse(f'{work_dir}/blis_csynth.xml')
+    available_bram = float(available_resources.find('BRAM_18K').text)
+    available_dsp = float(available_resources.find('DSP').text)
+    available_ff = float(available_resources.find('FF').text)
+    available_lut = float(available_resources.find('LUT').text)
 
-        report_root = report_tree.getroot()
+    performance_estimates = report_root.find('PerformanceEstimates')
 
-        resource_estimates = report_root.find('AreaEstimates')
+    latency = float(performance_estimates.find('SummaryOfOverallLatency').find('Worst-caseLatency').text)
+    latency_unit = performance_estimates.find('SummaryOfOverallLatency').find('unit').text
 
-        utilized_resources = resource_estimates.find('Resources')
-        available_resources = resource_estimates.find('AvailableResources')
+    bram = utilized_bram / available_bram
+    dsp = utilized_dsp / available_dsp
+    ff = utilized_ff / available_ff
+    lut = utilized_lut / available_lut
 
-        utilized_bram = float(utilized_resources.find('BRAM_18K').text)
-        utilized_dsp = float(utilized_resources.find('DSP').text)
-        utilized_ff = float(utilized_resources.find('FF').text)
-        utilized_lut = float(utilized_resources.find('LUT').text)
+    print(f'config: {config_desc}: bram: {bram}, dsp: {dsp}, ff: {ff}, lut: {lut}, latency: {latency} {latency_unit}, generated by: {con}')
 
-        available_bram = float(available_resources.find('BRAM_18K').text)
-        available_dsp = float(available_resources.find('DSP').text)
-        available_ff = float(available_resources.find('FF').text)
-        available_lut = float(available_resources.find('LUT').text)
-
-        performance_estimates = report_root.find('PerformanceEstimates')
-
-        latency = float(performance_estimates.find('SummaryOfOverallLatency').find('Worst-caseLatency').text)
-        latency_unit = performance_estimates.find('SummaryOfOverallLatency').find('unit').text
-
-        bram = utilized_bram / available_bram
-        dsp = utilized_dsp / available_dsp
-        ff = utilized_ff / available_ff
-        lut = utilized_lut / available_lut
-
-        print(f'config: {config_desc}: bram: {bram}, dsp: {dsp}, ff: {ff}, lut: {lut}, latency: {latency} {latency_unit}, generated by: {con}')
-
-        return Utilization(bram, dsp, ff, lut, latency, latency_unit)
+    return Utilization(bram, dsp, ff, lut, latency, latency_unit)
 
 
 T = TypeVar('T')
@@ -403,6 +426,9 @@ def should_process(config: Config) -> bool:
 
     matches = kernel_matches and c_lut_matches and bram_matches
 
+    # todo: check this back again
+    matches = kernel_matches and c_lut_matches and (estimated_bram_utilization <= bram_upper_limit)
+
     return matches
 
 
@@ -414,8 +440,8 @@ def gen_configs() -> list[Config]:
             for nc_f in pow2_range(NC_F_MIN, NC_F_MAX):
                 for ms_f in pow2_range(MS_F_MIN, MS_F_MAX):
                     for ns_f in pow2_range(NS_F_MIN, NS_F_MAX):
-                        for mr in pow2_range(MR_MIN, MR_MAX):
-                            for nr in pow2_range(NR_MIN, NR_MAX):
+                        for nr in pow2_range(NR_MIN, NR_MAX):
+                            for mr in range(MR_MIN, MR_MAX):
                                 config = Config(kc, mc_f, nc_f, ms_f, ns_f, mr, nr)
 
                                 if should_process(config):
