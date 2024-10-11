@@ -9,6 +9,10 @@
 // using this for modularity
 constexpr int KR = 1;
 
+constexpr int iter_count(int size, int factor) {
+  return (size + factor - 1) / factor;
+}
+
 template<typename T>
 static void print_arr(const char *prefix, T *arr, int m, int n) {
   std::cout << std::endl;
@@ -426,14 +430,14 @@ static void macro_kernel(const BlisVec<blis_data_a_t, NUM_ELEMENTS_PER_VEC_A> *a
   for (blis_size_t po = 0; po < k; po += kc) {
     #pragma HLS LOOP_FLATTEN off
 
-    #pragma HLS LOOP_TRIPCOUNT min = std::max(128 / kc, 1U) max = std::max(1024 / kc, 1U)
+    #pragma HLS LOOP_TRIPCOUNT min = iter_count(128, kc) max = iter_count(1024, kc)
 
     blis_size_t io_k = 0;
     blis_size_t io_n = 0;
 
     loop_macro_mm_io:
     for (blis_size_t io = 0; io < m; io += mc) {
-      #pragma HLS LOOP_TRIPCOUNT min = std::max(128 / mc, 1U) max = std::max(1024 / mc, 1U)
+      #pragma HLS LOOP_TRIPCOUNT min = iter_count(128, mc) max = iter_count(1024, mc)
 
       // todo: interchange the io & jo loops and check if it effects performance
       // todo: check the effects of vec_load_c in the actual impl vs theory and sim
@@ -442,7 +446,7 @@ static void macro_kernel(const BlisVec<blis_data_a_t, NUM_ELEMENTS_PER_VEC_A> *a
 
       loop_macro_mm_jo:
       for (blis_size_t jo = 0; jo < n; jo += nc) {
-        #pragma HLS LOOP_TRIPCOUNT min = std::max(128 / nc, 1U) max = std::max(1024 / nc, 1U)
+        #pragma HLS LOOP_TRIPCOUNT min = iter_count(128, nc) max = iter_count(1024, nc)
 
         vec_load<blis_data_b_t, NUM_ELEMENTS_PER_VEC_B, kc, nc, KR, nr>(po, jo, k, n, kn, po_n, b, bram_block_b);
 
